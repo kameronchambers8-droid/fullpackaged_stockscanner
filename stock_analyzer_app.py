@@ -1,14 +1,13 @@
 """
-Complete Stock Analysis Platform
-==================================
-Professional stock analysis with technical indicators, fundamentals,
-news sentiment, and trade recommendations.
+Complete Stock Analysis Platform - FIXED VERSION
+=================================================
+Optimized to minimize API calls and handle rate limits gracefully.
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 import requests
 from typing import Dict, List, Optional
 import plotly.graph_objects as go
@@ -39,9 +38,16 @@ st.markdown("""
         border-left: 4px solid #667eea;
         margin: 0.5rem 0;
     }
-    .signal-buy { background: #2ecc71; color: white; padding: 0.4rem 1rem; border-radius: 20px; }
-    .signal-sell { background: #e74c3c; color: white; padding: 0.4rem 1rem; border-radius: 20px; }
-    .signal-hold { background: #f39c12; color: white; padding: 0.4rem 1rem; border-radius: 20px; }
+    .signal-buy { background: #2ecc71; color: white; padding: 0.4rem 1rem; border-radius: 20px; display: inline-block; }
+    .signal-sell { background: #e74c3c; color: white; padding: 0.4rem 1rem; border-radius: 20px; display: inline-block; }
+    .signal-hold { background: #f39c12; color: white; padding: 0.4rem 1rem; border-radius: 20px; display: inline-block; }
+    .news-card {
+        background: #1a1d26;
+        padding: 1rem;
+        border-radius: 8px;
+        margin: 0.5rem 0;
+        border-left: 3px solid #3498db;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -49,31 +55,57 @@ st.markdown("""
 ALPHA_KEY = st.secrets.get("ALPHA_VANTAGE_KEY", "demo")
 FMP_KEY = st.secrets.get("FMP_KEY", "demo")
 
-# API Functions
+# Session state for caching
+if 'last_symbol' not in st.session_state:
+    st.session_state.last_symbol = None
+if 'cached_data' not in st.session_state:
+    st.session_state.cached_data = None
+if 'api_calls_today' not in st.session_state:
+    st.session_state.api_calls_today = 0
+
+# API Functions with error handling
+@st.cache_data(ttl=3600)  # Cache for 1 hour
 def fetch_stock_data(symbol: str) -> Optional[pd.DataFrame]:
-    """Fetch daily stock data"""
+    """Fetch daily stock data - CACHED"""
     try:
         url = "https://www.alphavantage.co/query"
         params = {
             "function": "TIME_SERIES_DAILY",
             "symbol": symbol,
             "apikey": ALPHA_KEY,
-            "outputsize": "full"
+            "outputsize": "compact"  # Only last 100 days to save quota
         }
         
-        response = requests.get(url, params=params, timeout=10)
+        response = requests.get(url, params=params, timeout=15)
         data = response.json()
         
+        # Check for errors
         if "Error Message" in data:
-            st.error(f"Invalid ticker: {symbol}")
+            st.error(f"❌ Invalid ticker symbol: {symbol}")
             return None
         
         if "Note" in data:
-            st.warning("API limit reached. Try again tomorrow or upgrade.")
+            st.error("""
+            🚨 **API Rate Limit Reached!**
+            
+            You've used your 25 free API calls for today.
+            
+            **Options:**
+            1. Wait until tomorrow (resets in 24 hours)
+            2. Use the demo with cached data
+            3. Upgrade to paid Alpha Vantage plan ($50/month unlimited)
+            
+            **Tip:** Each stock search uses 1-3 API calls. Plan your searches!
+            """)
+            return None
+        
+        if "Information" in data:
+            st.warning(f"⚠️ {data['Information']}")
             return None
         
         time_series = data.get("Time Series (Daily)", {})
         if not time_series:
+            st.error("❌ No data returned. Check ticker symbol.")
             return None
         
         df = pd.DataFrame.from_dict(time_series, orient='index')
@@ -82,13 +114,23 @@ def fetch_stock_data(symbol: str) -> Optional[pd.DataFrame]:
         df.columns = ['open', 'high', 'low', 'close', 'volume']
         df = df.astype(float)
         
+        st.session_state.api_calls_today += 1
+        
         return df
+        
+    except requests.exceptions.Timeout:
+        st.error("❌ Request timed out. Try again in a moment.")
+        return None
+    except requests.exceptions.RequestException as e:
+        st.error(f"❌ Network error: {e}")
+        return None
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"❌ Unexpected error: {e}")
         return None
 
+@st.cache_data(ttl=3600)
 def fetch_company_overview(symbol: str) -> Optional[Dict]:
-    """Fetch company fundamentals"""
+    """Fetch company fundamentals - CACHED"""
     try:
         url = "https://www.alphavantage.co/query"
         params = {
@@ -96,23 +138,36 @@ def fetch_company_overview(symbol: str) -> Optional[Dict]:
             "symbol": symbol,
             "apikey": ALPHA_KEY
         }
-        response = requests.get(url, params=params, timeout=10)
-        return response.json()
+        response = requests.get(url, params=params, timeout=15)
+        data = response.json()
+        
+        if "Note" in data:
+            return None
+        
+        st.session_state.api_calls_today += 1
+        return data
     except:
         return None
 
+@st.cache_data(ttl=1800)  # Cache for 30 min
 def fetch_news(symbol: str) -> List[Dict]:
-    """Fetch news with sentiment"""
+    """Fetch news with sentiment - CACHED"""
     try:
         url = "https://www.alphavantage.co/query"
         params = {
             "function": "NEWS_SENTIMENT",
             "tickers": symbol,
             "apikey": ALPHA_KEY,
-            "limit": 10
+            "limit": 5,
+            "sort": "LATEST"
         }
-        response = requests.get(url, params=params, timeout=10)
+        response = requests.get(url, params=params, timeout=15)
         data = response.json()
+        
+        if "Note" in data:
+            return []
+        
+        st.session_state.api_calls_today += 1
         return data.get('feed', [])
     except:
         return []
@@ -126,10 +181,10 @@ def calc_rsi(prices, period=14):
     return 100 - (100 / (1 + rs))
 
 def calc_macd(prices):
-    exp1 = prices.ewm(span=12).mean()
-    exp2 = prices.ewm(span=26).mean()
+    exp1 = prices.ewm(span=12, adjust=False).mean()
+    exp2 = prices.ewm(span=26, adjust=False).mean()
     macd = exp1 - exp2
-    signal = macd.ewm(span=9).mean()
+    signal = macd.ewm(span=9, adjust=False).mean()
     return macd, signal, macd - signal
 
 def calc_bb(prices, period=20):
@@ -150,31 +205,39 @@ def get_signals(df):
     price = df['close'].iloc[-1]
     
     # RSI
-    rsi = calc_rsi(df['close']).iloc[-1]
-    if rsi < 30:
-        signals['RSI'] = ('BUY', f'{rsi:.1f}', 'Oversold')
-    elif rsi > 70:
-        signals['RSI'] = ('SELL', f'{rsi:.1f}', 'Overbought')
-    else:
-        signals['RSI'] = ('HOLD', f'{rsi:.1f}', 'Neutral')
+    rsi = calc_rsi(df['close'])
+    rsi_val = rsi.iloc[-1]
+    if pd.notna(rsi_val):
+        if rsi_val < 30:
+            signals['RSI'] = ('BUY', f'{rsi_val:.1f}', 'Oversold')
+        elif rsi_val > 70:
+            signals['RSI'] = ('SELL', f'{rsi_val:.1f}', 'Overbought')
+        else:
+            signals['RSI'] = ('HOLD', f'{rsi_val:.1f}', 'Neutral')
     
     # MACD
-    macd, signal, hist = calc_macd(df['close'])
-    if macd.iloc[-1] > signal.iloc[-1] and macd.iloc[-2] <= signal.iloc[-2]:
-        signals['MACD'] = ('BUY', f'{macd.iloc[-1]:.2f}', 'Bullish cross')
-    elif macd.iloc[-1] < signal.iloc[-1] and macd.iloc[-2] >= signal.iloc[-2]:
-        signals['MACD'] = ('SELL', f'{macd.iloc[-1]:.2f}', 'Bearish cross')
-    else:
-        signals['MACD'] = ('HOLD', f'{macd.iloc[-1]:.2f}', 'No cross')
+    macd, signal_line, hist = calc_macd(df['close'])
+    macd_val = macd.iloc[-1]
+    signal_val = signal_line.iloc[-1]
+    
+    if pd.notna(macd_val) and pd.notna(signal_val):
+        if len(macd) > 1:
+            if macd_val > signal_val and macd.iloc[-2] <= signal_line.iloc[-2]:
+                signals['MACD'] = ('BUY', f'{macd_val:.2f}', 'Bullish cross')
+            elif macd_val < signal_val and macd.iloc[-2] >= signal_line.iloc[-2]:
+                signals['MACD'] = ('SELL', f'{macd_val:.2f}', 'Bearish cross')
+            else:
+                signals['MACD'] = ('HOLD', f'{macd_val:.2f}', 'No cross')
     
     # BB
     upper, mid, lower = calc_bb(df['close'])
-    if price <= lower.iloc[-1]:
-        signals['BB'] = ('BUY', f'${price:.2f}', 'At lower band')
-    elif price >= upper.iloc[-1]:
-        signals['BB'] = ('SELL', f'${price:.2f}', 'At upper band')
-    else:
-        signals['BB'] = ('HOLD', f'${price:.2f}', 'In bands')
+    if pd.notna(lower.iloc[-1]) and pd.notna(upper.iloc[-1]):
+        if price <= lower.iloc[-1]:
+            signals['BB'] = ('BUY', f'${price:.2f}', 'At lower band')
+        elif price >= upper.iloc[-1]:
+            signals['BB'] = ('SELL', f'${price:.2f}', 'At upper band')
+        else:
+            signals['BB'] = ('HOLD', f'${price:.2f}', 'In bands')
     
     # MA
     ma = calc_ma(df['close'])
@@ -192,6 +255,9 @@ def get_signals(df):
 
 def get_recommendation(signals):
     """Overall recommendation"""
+    if not signals:
+        return "INSUFFICIENT DATA"
+    
     buy_count = sum(1 for s in signals.values() if s[0] == 'BUY')
     sell_count = sum(1 for s in signals.values() if s[0] == 'SELL')
     total = len(signals)
@@ -210,14 +276,41 @@ def get_recommendation(signals):
 st.markdown('<h1 class="main-header">📈 Stock Analysis Platform</h1>', unsafe_allow_html=True)
 st.markdown('<p style="text-align:center; color:#7f8c8d;">Professional stock analysis for smarter trading</p>', unsafe_allow_html=True)
 
+# API usage counter
+if st.session_state.api_calls_today > 0:
+    remaining = 25 - st.session_state.api_calls_today
+    if remaining <= 5:
+        st.warning(f"⚠️ API Calls Remaining Today: **{remaining}/25** - Use wisely!")
+    else:
+        st.info(f"📊 API Calls Used: {st.session_state.api_calls_today}/25")
+
 # Sidebar
 with st.sidebar:
     st.header("🔍 Stock Search")
     symbol = st.text_input("Enter Ticker", "AAPL").upper()
+    
+    if st.button("🔄 Analyze Stock", type="primary"):
+        st.session_state.last_symbol = symbol
+        st.rerun()
+    
+    st.markdown("---")
+    
+    st.markdown("### 💡 Tips")
+    st.markdown("""
+    - Each search uses 1-3 API calls
+    - 25 calls per day limit
+    - Data cached for 1 hour
+    - Try: AAPL, TSLA, MSFT, NVDA
+    """)
+    
     st.markdown("---")
     st.markdown("**Quick Links**")
     st.markdown("- [Webull](https://webull.com)")
     st.markdown("- [Yahoo Finance](https://finance.yahoo.com)")
+
+# Only fetch data when button is clicked or symbol changes
+if st.session_state.last_symbol:
+    symbol = st.session_state.last_symbol
 
 # Tabs
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -230,9 +323,9 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 
 # TAB 1: Technical Analysis
 with tab1:
-    if symbol:
-        with st.spinner(f"Analyzing {symbol}..."):
-            df = fetch_stock_data(symbol)
+    if st.session_state.last_symbol:
+        with st.spinner(f"Analyzing {st.session_state.last_symbol}..."):
+            df = fetch_stock_data(st.session_state.last_symbol)
             
             if df is not None and not df.empty:
                 price = df['close'].iloc[-1]
@@ -277,9 +370,9 @@ with tab1:
                 )
                 
                 # Bollinger Bands
-                fig.add_trace(go.Scatter(x=df.index, y=bb_upper, name='BB Upper', line=dict(dash='dash', color='red')), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df.index, y=bb_mid, name='BB Mid', line=dict(dash='dash', color='gray')), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df.index, y=bb_lower, name='BB Lower', line=dict(dash='dash', color='green')), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=bb_upper, name='BB Upper', line=dict(dash='dash', color='rgba(255,100,100,0.5)')), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=bb_mid, name='BB Mid', line=dict(dash='dash', color='rgba(200,200,200,0.5)')), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=bb_lower, name='BB Lower', line=dict(dash='dash', color='rgba(100,255,100,0.5)')), row=1, col=1)
                 
                 # Moving Averages
                 fig.add_trace(go.Scatter(x=df.index, y=ma['sma50'], name='SMA 50', line=dict(color='orange')), row=1, col=1)
@@ -304,44 +397,56 @@ with tab1:
                 
                 with ind_col1:
                     rsi_val = rsi.iloc[-1]
-                    st.metric("RSI (14)", f"{rsi_val:.1f}", 
-                             "Oversold" if rsi_val < 30 else "Overbought" if rsi_val > 70 else "Neutral")
+                    if pd.notna(rsi_val):
+                        st.metric("RSI (14)", f"{rsi_val:.1f}", 
+                                 "Oversold" if rsi_val < 30 else "Overbought" if rsi_val > 70 else "Neutral")
                 
                 with ind_col2:
-                    st.metric("MACD", f"{macd.iloc[-1]:.3f}", 
-                             f"Signal: {signal_line.iloc[-1]:.3f}")
+                    if pd.notna(macd.iloc[-1]):
+                        st.metric("MACD", f"{macd.iloc[-1]:.3f}", 
+                                 f"Signal: {signal_line.iloc[-1]:.3f}")
                 
                 with ind_col3:
-                    st.metric("SMA 50", f"${ma['sma50'].iloc[-1]:.2f}" if pd.notna(ma['sma50'].iloc[-1]) else "N/A")
+                    if pd.notna(ma['sma50'].iloc[-1]):
+                        st.metric("SMA 50", f"${ma['sma50'].iloc[-1]:.2f}")
                 
                 with ind_col4:
-                    st.metric("SMA 200", f"${ma['sma200'].iloc[-1]:.2f}" if pd.notna(ma['sma200'].iloc[-1]) else "N/A")
+                    if pd.notna(ma['sma200'].iloc[-1]):
+                        st.metric("SMA 200", f"${ma['sma200'].iloc[-1]:.2f}")
+            else:
+                st.info("👈 Click 'Analyze Stock' in the sidebar to get started")
+    else:
+        st.info("👈 Enter a ticker symbol and click 'Analyze Stock' to begin")
 
 # TAB 2: News & Fundamentals
 with tab2:
-    if symbol:
-        st.subheader("📰 Latest News")
-        news = fetch_news(symbol)
+    if st.session_state.last_symbol:
+        st.subheader(f"📰 Latest News for {st.session_state.last_symbol}")
+        news = fetch_news(st.session_state.last_symbol)
         
         if news:
-            for article in news[:5]:
-                sentiment_score = float(article.get('overall_sentiment_score', 0))
-                sentiment_class = "positive-sentiment" if sentiment_score > 0.15 else "negative-sentiment" if sentiment_score < -0.15 else "neutral-sentiment"
-                
-                st.markdown(f"""
-                <div class="news-card {sentiment_class}">
-                    <h4>{article.get('title', 'No title')}</h4>
-                    <p><small>{article.get('source', 'Unknown')} | {article.get('time_published', '')[:10]}</small></p>
-                    <p>Sentiment: {sentiment_score:.2f} {'🟢' if sentiment_score > 0.15 else '🔴' if sentiment_score < -0.15 else '⚪'}</p>
-                    <a href="{article.get('url', '#')}" target="_blank">Read more →</a>
-                </div>
-                """, unsafe_allow_html=True)
+            for article in news:
+                try:
+                    sentiment_score = float(article.get('overall_sentiment_score', 0))
+                    sentiment_class = "positive-sentiment" if sentiment_score > 0.15 else "negative-sentiment" if sentiment_score < -0.15 else "neutral-sentiment"
+                    sentiment_emoji = '🟢' if sentiment_score > 0.15 else '🔴' if sentiment_score < -0.15 else '⚪'
+                    
+                    st.markdown(f"""
+                    <div class="news-card">
+                        <h4>{article.get('title', 'No title')[:100]}...</h4>
+                        <p><small>{article.get('source', 'Unknown')} | {article.get('time_published', '')[:10]}</small></p>
+                        <p>Sentiment: {sentiment_score:.2f} {sentiment_emoji}</p>
+                        <a href="{article.get('url', '#')}" target="_blank">Read more →</a>
+                    </div>
+                    """, unsafe_allow_html=True)
+                except:
+                    continue
         else:
-            st.info("No recent news available")
+            st.info("No recent news available or rate limit reached")
         
         st.markdown("---")
-        st.subheader("📊 Company Fundamentals")
-        overview = fetch_company_overview(symbol)
+        st.subheader(f"📊 Company Fundamentals for {st.session_state.last_symbol}")
+        overview = fetch_company_overview(st.session_state.last_symbol)
         
         if overview and 'Symbol' in overview:
             fund_col1, fund_col2, fund_col3, fund_col4 = st.columns(4)
@@ -355,12 +460,16 @@ with tab2:
                 st.metric("Dividend Yield", overview.get('DividendYield', 'N/A'))
             
             with fund_col3:
-                st.metric("52W High", overview.get('52WeekHigh', 'N/A'))
-                st.metric("52W Low", overview.get('52WeekLow', 'N/A'))
+                st.metric("52W High", f"${float(overview.get('52WeekHigh', 0)):.2f}" if overview.get('52WeekHigh') else 'N/A')
+                st.metric("52W Low", f"${float(overview.get('52WeekLow', 0)):.2f}" if overview.get('52WeekLow') else 'N/A')
             
             with fund_col4:
                 st.metric("Beta", overview.get('Beta', 'N/A'))
                 st.metric("Sector", overview.get('Sector', 'N/A'))
+        else:
+            st.info("Fundamentals not available or rate limit reached")
+    else:
+        st.info("👈 Enter a ticker and click 'Analyze Stock'")
 
 # TAB 3: P/L Calculator
 with tab3:
@@ -424,20 +533,12 @@ with tab3:
 with tab4:
     st.subheader("🎯 Trade Recommendation")
     
-    if symbol:
-        df = fetch_stock_data(symbol)
+    if st.session_state.last_symbol:
+        df = fetch_stock_data(st.session_state.last_symbol)
         
         if df is not None and not df.empty:
             signals = get_signals(df)
             recommendation = get_recommendation(signals)
-            
-            rec_colors = {
-                'STRONG BUY': 'success',
-                'BUY': 'success',
-                'HOLD': 'warning',
-                'SELL': 'error',
-                'STRONG SELL': 'error'
-            }
             
             if recommendation in ['STRONG BUY', 'BUY']:
                 st.success(f"## {recommendation}")
@@ -449,19 +550,24 @@ with tab4:
             st.markdown("---")
             st.subheader("📊 Signal Breakdown")
             
-            sig_cols = st.columns(len(signals))
-            
-            for idx, (indicator, (signal, value, reason)) in enumerate(signals.items()):
-                with sig_cols[idx]:
-                    badge_class = f"signal-{signal.lower()}"
-                    st.markdown(f"""
-                    <div class="metric-card">
-                        <h3>{indicator}</h3>
-                        <span class="{badge_class}">{signal}</span>
-                        <p style="margin-top:1rem;">{reason}</p>
-                        <p><small>Value: {value}</small></p>
-                    </div>
-                    """, unsafe_allow_html=True)
+            if signals:
+                sig_cols = st.columns(len(signals))
+                
+                for idx, (indicator, (signal, value, reason)) in enumerate(signals.items()):
+                    with sig_cols[idx]:
+                        badge_class = f"signal-{signal.lower()}"
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <h3>{indicator}</h3>
+                            <span class="{badge_class}">{signal}</span>
+                            <p style="margin-top:1rem;">{reason}</p>
+                            <p><small>Value: {value}</small></p>
+                        </div>
+                        """, unsafe_allow_html=True)
+            else:
+                st.info("Not enough data to generate signals")
+    else:
+        st.info("👈 Enter a ticker and click 'Analyze Stock'")
 
 # TAB 5: Trade Journal
 with tab5:
@@ -485,8 +591,8 @@ with tab5:
             st.date_input("Trade Date")
             st.text_input("Ticker")
             st.selectbox("Type", ["Long", "Short"])
-            st.number_input("Entry Price", 0.0)
-            st.number_input("Exit Price", 0.0)
+            st.number_input("Entry Price ($)", 0.0)
+            st.number_input("Exit Price ($)", 0.0)
         
         with j_col2:
             st.selectbox("Strategy", ["Breakout", "Trend", "Mean Reversion", "News", "Other"])
